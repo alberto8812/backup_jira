@@ -1,8 +1,8 @@
 import 'dotenv/config';
 import { mkdir, writeFile } from 'node:fs/promises';
 import type { BackupConfig } from './types.js';
-import { fetchAllIssues } from './jira-client.js';
-import { downloadAttachment } from './downloader.js';
+import { fetchAllIssues, fetchAllComments } from './jira-client.js';
+import { downloadAttachment, downloadCommentMedia, extractAttachmentIdsFromHtml } from './downloader.js';
 
 function loadConfig(): BackupConfig {
   const required = [
@@ -57,11 +57,31 @@ async function run(): Promise<void> {
 
   console.log(`[backup] Total issues fetched: ${issues.length}`);
 
-  // Persist issues.json
+  // Fetch and embed comments per issue
+  console.log('[backup] Fetching comments per issue...');
+  const total = issues.length;
+  for (let i = 0; i < total; i++) {
+    const issue = issues[i]!;
+    console.log(`[backup] [${i + 1}/${total}] fetching comments for ${issue.key}`);
+    issue.comments = await fetchAllComments(cfg, issue.key);
+    if (i < total - 1) {
+      await sleep(150);
+    }
+  }
+
+  // Persist issues.json (now includes embedded comments)
   await mkdir(outputDir, { recursive: true });
   const issuesJsonPath = `${outputDir}/issues.json`;
   await writeFile(issuesJsonPath, JSON.stringify(issues, null, 2), 'utf-8');
   console.log(`[backup] issues.json written → ${issuesJsonPath}`);
+
+  // Build run-wide dedup set seeded with issue-level attachment IDs
+  const seenAttachmentIds = new Set<string>();
+  for (const issue of issues) {
+    for (const att of issue.fields.attachment ?? []) {
+      seenAttachmentIds.add(att.id);
+    }
+  }
 
   // Collect all attachments with their issueKey
   const attachmentJobs = issues.flatMap((issue) => {
@@ -92,13 +112,57 @@ async function run(): Promise<void> {
     }
   }
 
+  // Build and download comment-media jobs (deduplicated against issue-level attachments)
+  const commentMediaJobs: { id: string; issueKey: string }[] = [];
+  for (const issue of issues) {
+    for (const comment of issue.comments ?? []) {
+      for (const id of extractAttachmentIdsFromHtml(comment.renderedBody)) {
+        if (!seenAttachmentIds.has(id)) {
+          seenAttachmentIds.add(id);
+          commentMediaJobs.push({ id, issueKey: issue.key });
+        }
+      }
+    }
+  }
+
+  console.log(`[backup] Comment media to download: ${commentMediaJobs.length}`);
+
+  let commentMediaDownloaded = 0;
+  let commentMediaFailed = 0;
+
+  for (let i = 0; i < commentMediaJobs.length; i++) {
+    const { id, issueKey } = commentMediaJobs[i]!;
+    const result = await downloadCommentMedia(cfg, id, issueKey, attachmentsDir);
+
+    if (result.ok) {
+      commentMediaDownloaded++;
+      console.log(
+        `[backup] Comment media downloaded [${commentMediaDownloaded}/${commentMediaJobs.length}] ${issueKey}/comment-media/${result.filename}`,
+      );
+    } else {
+      commentMediaFailed++;
+      console.warn(
+        `[backup] WARN: Failed to download comment media ${issueKey}/attachment-${id} — ${result.error}`,
+      );
+    }
+
+    // Sleep between downloads to stay under rate limits (skip after last item)
+    if (i < commentMediaJobs.length - 1) {
+      await sleep(150);
+    }
+  }
+
   // Final summary
   console.log(
-    `\n[backup] Done — ${issues.length} issues, ${downloaded} attachments downloaded, ${failed} failed`,
+    `\n[backup] Done — ${issues.length} issues, ${downloaded} attachments downloaded, ${failed} failed, ${commentMediaDownloaded} comment media downloaded, ${commentMediaFailed} comment media failed`,
   );
 
   if (failed > 0) {
     console.warn(`[backup] ${failed} attachment(s) could not be downloaded. Check logs above.`);
+  }
+
+  if (commentMediaFailed > 0) {
+    console.warn(`[backup] ${commentMediaFailed} comment media file(s) could not be downloaded. Check logs above.`);
   }
 }
 

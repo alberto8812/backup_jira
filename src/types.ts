@@ -13,6 +13,22 @@ export interface JiraAttachment {
   size: number;
 }
 
+export interface JiraComment {
+  id: string;
+  author: { displayName: string } | null;
+  body: unknown;
+  renderedBody?: string;
+  created: string;
+  updated: string;
+}
+
+export interface CommentPage {
+  startAt: number;
+  maxResults: number;
+  total: number;
+  comments: JiraComment[];
+}
+
 export interface JiraIssue {
   id: string;
   key: string;
@@ -29,6 +45,7 @@ export interface JiraIssue {
   };
   renderedFields?: Record<string, unknown>;
   names?: Record<string, string>;
+  comments?: JiraComment[];
 }
 
 export interface SearchResponse {

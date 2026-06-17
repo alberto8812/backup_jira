@@ -4,6 +4,17 @@ import { pipeline } from 'node:stream/promises';
 import type { BackupConfig, JiraAttachment, DownloadResult } from './types.js';
 import { createAuthHeader } from './jira-client.js';
 
+const ATTACHMENT_CONTENT_RE = /\/rest\/api\/3\/attachment\/content\/(\d+)/g;
+
+export function extractAttachmentIdsFromHtml(html: string | undefined): string[] {
+  if (!html) return [];
+  const ids = new Set<string>();
+  for (const m of html.matchAll(ATTACHMENT_CONTENT_RE)) {
+    ids.add(m[1]!);
+  }
+  return [...ids];
+}
+
 export function sanitizeFilename(name: string): string {
   return (
     name
@@ -136,6 +147,127 @@ export async function downloadAttachment(
   return {
     issueKey,
     filename: safeFilename,
+    ok: false,
+    error: 'Exhausted retry loop unexpectedly',
+  };
+}
+
+function filenameFromContentDisposition(header: string | null, fallbackId: string): string {
+  if (header) {
+    // RFC 5987 filename*=UTF-8''... preferred
+    const star = /filename\*=(?:UTF-8'')?([^;]+)/i.exec(header);
+    if (star?.[1]) return sanitizeFilename(decodeURIComponent(star[1].replace(/^"|"$/g, '')));
+    // Plain filename="..."
+    const plain = /filename="?([^";]+)"?/i.exec(header);
+    if (plain?.[1]) return sanitizeFilename(plain[1]);
+  }
+  return sanitizeFilename(`attachment-${fallbackId}`);
+}
+
+export async function downloadCommentMedia(
+  cfg: BackupConfig,
+  attachmentId: string,
+  issueKey: string,
+  baseDir: string,
+): Promise<DownloadResult> {
+  const mediaDir = `${baseDir}/${issueKey}/comment-media`;
+
+  try {
+    await ensureDir(mediaDir);
+  } catch (err) {
+    return {
+      issueKey,
+      filename: `attachment-${attachmentId}`,
+      ok: false,
+      error: `Failed to create directory ${mediaDir}: ${String(err)}`,
+    };
+  }
+
+  const url = `${cfg.baseUrl}/rest/api/3/attachment/content/${attachmentId}`;
+  const authHeader = createAuthHeader(cfg);
+
+  const maxRetries = 3;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let res: Response;
+
+    try {
+      res = await fetch(url, {
+        headers: {
+          Authorization: authHeader,
+        },
+      });
+    } catch (err) {
+      if (attempt >= maxRetries) {
+        return {
+          issueKey,
+          filename: `attachment-${attachmentId}`,
+          ok: false,
+          error: `Network error after ${maxRetries} retries: ${String(err)}`,
+        };
+      }
+      await sleep(1000 * Math.pow(2, attempt));
+      continue;
+    }
+
+    if (res.status === 429) {
+      if (attempt >= maxRetries) {
+        return {
+          issueKey,
+          filename: `attachment-${attachmentId}`,
+          ok: false,
+          error: `Rate limited (429) after ${maxRetries} retries — skipping attachment-${attachmentId}`,
+        };
+      }
+      const retryAfter = res.headers.get('Retry-After');
+      const waitMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 1000 * Math.pow(2, attempt);
+      console.warn(
+        `[downloader] 429 for attachment-${attachmentId} — waiting ${waitMs}ms (retry ${attempt + 1}/${maxRetries})`,
+      );
+      await sleep(waitMs);
+      continue;
+    }
+
+    if (!res.ok) {
+      return {
+        issueKey,
+        filename: `attachment-${attachmentId}`,
+        ok: false,
+        error: `HTTP ${res.status} downloading comment media attachment-${attachmentId} for ${issueKey}`,
+      };
+    }
+
+    if (!res.body) {
+      return {
+        issueKey,
+        filename: `attachment-${attachmentId}`,
+        ok: false,
+        error: `Empty response body for comment media attachment-${attachmentId}`,
+      };
+    }
+
+    const filename = filenameFromContentDisposition(res.headers.get('Content-Disposition'), attachmentId);
+    const destPath = `${mediaDir}/${filename}`;
+
+    try {
+      const writeStream = fs.createWriteStream(destPath);
+      await pipeline(res.body as unknown as NodeJS.ReadableStream, writeStream);
+
+      return { issueKey, filename, ok: true };
+    } catch (err) {
+      return {
+        issueKey,
+        filename,
+        ok: false,
+        error: `Write error for comment media attachment-${attachmentId}: ${String(err)}`,
+      };
+    }
+  }
+
+  // Should never reach here
+  return {
+    issueKey,
+    filename: `attachment-${attachmentId}`,
     ok: false,
     error: 'Exhausted retry loop unexpectedly',
   };
